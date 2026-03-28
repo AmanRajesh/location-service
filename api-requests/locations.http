@@ -1,0 +1,32 @@
+### 1. Update Vehicle 1 Location (Your Vehicle)
+# Replace the sessionId with a real one you got from Journey Service!
+POST http://127.0.0.1:8090/api/v1/locations/update
+Content-Type: application/json
+
+{
+  "sessionId": "de67025b-a359-4f40-a6d9-25d495f33ee0",
+  "vehicleType": "car",
+  "latitude": 22.5730,
+  "longitude": 88.3670
+}
+
+###
+
+### 2. Update Vehicle 2 Location (Nearby Vehicle - 500 meters away)
+POST http://127.0.0.1:8090/api/v1/locations/update
+Content-Type: application/json
+
+{
+  "sessionId": "c40cdd1a-b3b3-4cbf-943e-5f1fbfa962c8",
+  "vehicleType": "car",
+  "latitude": 22.5750,
+  "longitude": 88.3770
+}
+
+###
+
+### 3. Stream Nearby Vehicles (The Radar)
+# Open this and leave it running! It will stream updates every 2 seconds.
+# We are centering the radar exactly on Vehicle 1's coordinates.
+GET http://127.0.0.1:8090/api/v1/locations/nearby?sessionId=91f88756-61ed-402a-80df-103c46fddb05
+Accept: text/event-stream
