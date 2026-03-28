@@ -22,7 +22,7 @@ public class JourneyEventListener {
             locationService.removeVehicle(event.sessionId())
                     .doOnSuccess(v -> System.out.println("✅ Ghost Vehicle eliminated from radar."))
                     .doOnError(e -> System.err.println("❌ Failed to remove vehicle: " + e.getMessage()))
-                    .subscribe();
+                    .block();
         }
     }
 }
