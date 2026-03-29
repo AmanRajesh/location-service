@@ -2,6 +2,7 @@ package com.IDP.location_service.websocket;
 
 import com.IDP.location_service.model.VehicleLocation;
 import com.IDP.location_service.service.LocationService;
+import com.IDP.location_service.util.JwtUtil;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.socket.WebSocketHandler;
@@ -16,10 +17,13 @@ public class LocationWebSocketHandler implements WebSocketHandler {
 
     private final LocationService locationService;
     private final ObjectMapper objectMapper;
+    private final JwtUtil jwtUtil;
 
-    public LocationWebSocketHandler(LocationService locationService, ObjectMapper objectMapper) {
+    public LocationWebSocketHandler(LocationService locationService, ObjectMapper objectMapper,JwtUtil jwtUtil) {
         this.locationService = locationService;
         this.objectMapper = objectMapper;
+        this.jwtUtil = jwtUtil;
+
     }
 
     @Override
@@ -27,10 +31,26 @@ public class LocationWebSocketHandler implements WebSocketHandler {
 
         // 1. Extract the sessionId from the connection URL
         // Example: ws://localhost:8090/ws/locations?sessionId=driver-123
-        String sessionId = UriComponentsBuilder.fromUri(session.getHandshakeInfo().getUri())
+        // 1. Extract the token instead of sessionId
+        String token = UriComponentsBuilder.fromUri(session.getHandshakeInfo().getUri())
                 .build()
                 .getQueryParams()
-                .getFirst("sessionId");
+                .getFirst("token");
+
+        if (token == null) {
+            System.err.println("❌ WS Rejected: No token provided");
+            return session.close();
+        }
+
+        String sessionId;
+        try {
+            // 2. Validate it using your existing JwtUtil (you will need to inject JwtUtil into this class constructor)
+
+            sessionId = jwtUtil.extractAndValidateSessionId(token);
+        } catch (Exception e) {
+            System.err.println("❌ WS Rejected: Invalid Token");
+            return session.close();
+        }
 
         System.out.println("🟢 WS Connected for Session: " + sessionId);
 

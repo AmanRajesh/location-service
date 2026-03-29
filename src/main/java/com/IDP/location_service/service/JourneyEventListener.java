@@ -19,7 +19,7 @@ public class JourneyEventListener {
         System.out.println("🎧 [LOCATION SERVICE] Received: " + event.eventType() + " for Session: " + event.sessionId());
 
         if ("JOURNEY_ENDED".equals(event.eventType())) {
-            locationService.removeVehicle(event.sessionId())
+            locationService.removeVehicle(event.vehicleType(),event.sessionId())
                     .doOnSuccess(v -> System.out.println("✅ Ghost Vehicle eliminated from radar."))
                     .doOnError(e -> System.err.println("❌ Failed to remove vehicle: " + e.getMessage()))
                     .block();
