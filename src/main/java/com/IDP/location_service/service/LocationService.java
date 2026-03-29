@@ -128,19 +128,19 @@ public class LocationService {
         Mono<Long> removeTrail = redisTemplate.delete(trailKey);
         Mono<Long> removeOffline = redisTemplate.opsForSet().remove(OFFLINE_KEY, sessionId);
         Mono<Boolean> plantTombstone = redisTemplate.opsForValue()
-                    .set(tombstoneKey, "DEAD", Duration.ofHours(24));
+                .set(tombstoneKey, "DEAD", Duration.ofHours(24));
         // 🚨 Also clean up heartbeat and stationary keys so we don't get false positives
         Mono<Long> removeHeartbeat = redisTemplate.opsForZSet().remove(HEARTBEAT_KEY, sessionId);
         Mono<Long> removeStationary = redisTemplate.delete(stationaryKey);
 
-            return Mono.when(
-                    removeGeo,
-                    removeTrail,
-                    removeHeartbeat,
-                    removeStationary,
-                    removeOffline,
-                    plantTombstone
-            );
+        return Mono.when(
+                removeGeo,
+                removeTrail,
+                removeHeartbeat,
+                removeStationary,
+                removeOffline,
+                plantTombstone
+        );
     }
 
     // ==========================================
@@ -149,7 +149,7 @@ public class LocationService {
     public Flux<java.util.List<NearbyVehicle>> streamNearbyVehicles(String sessionId) {
         return Flux.interval(Duration.ofSeconds(2))
                 .flatMap(tick -> {
-                    return redisTemplate.opsForZSet().range(GEO_KEY, Range.closed(0L,-1L))
+                    return redisTemplate.opsForZSet().range(GEO_KEY, Range.closed(0L, -1L))
                             .filter(member -> String.valueOf(member).endsWith(":" + sessionId))
                             .next()
                             .flatMap(this::findVehiclesNearby)
@@ -193,19 +193,32 @@ public class LocationService {
     public void scanForLostSignals() {
         long cutoffTime = System.currentTimeMillis() - SIGNAL_LOST_THRESHOLD_MS;
 
-        // Find all sessions where the timestamp score is older than our 3-minute cutoff
-        redisTemplate.opsForZSet().rangeByScore(HEARTBEAT_KEY, org.springframework.data.domain.Range.closed(0.0, (double) cutoffTime))
-                .flatMap(memberObj -> {
-                    String sessionId = String.valueOf(memberObj);
+        redisTemplate.opsForZSet()
+                // 1. Get the list of all expired session IDs first
+                .rangeByScore(HEARTBEAT_KEY, org.springframework.data.domain.Range.closed(0.0, (double) cutoffTime))
+                .collectList()
+                .flatMapMany(Flux::fromIterable) // 2. Now process them one by one
+                .flatMap(sessionIdObj -> {
+                    String sessionId = String.valueOf(sessionIdObj);
+                    String trailKey = "trail:" + sessionId;
 
-                    // Publish the event
-                    anomalyPublisher.publishSignalLost(sessionId);
+                    return redisTemplate.opsForList().range(trailKey, 0, -1)
+                            .collectList()
+                            .flatMap(trail -> {
+                                // 3. Publish the Snapshot
+                                anomalyPublisher.publishSignalLostWithHistory(sessionId, trail);
 
-                    Mono<Long> markOffline = redisTemplate.opsForSet().add(OFFLINE_KEY, sessionId);
-                    Mono<Long> removeHeartbeat = redisTemplate.opsForZSet().remove(HEARTBEAT_KEY, sessionId);
-
-                    return Mono.when(markOffline, removeHeartbeat);
+                                // 4. Cleanup
+                                return Mono.when(
+                                        redisTemplate.opsForSet().add(OFFLINE_KEY, sessionId),
+                                        redisTemplate.opsForZSet().remove(HEARTBEAT_KEY, sessionId)
+                                );
+                            });
                 })
-                .subscribe(); // Subscribe is required to trigger a reactive flow in a void @Scheduled method
+                .subscribe(
+                        null,
+                        err -> System.err.println("❌ Error in Signal Scan: " + err.getMessage()),
+                        () -> System.out.println("🔭 Signal scan complete.")
+                );
     }
 }
