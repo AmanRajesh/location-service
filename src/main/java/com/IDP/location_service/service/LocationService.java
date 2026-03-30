@@ -106,6 +106,9 @@ public class LocationService {
     // ==========================================
     // 1. UPDATE LOCATION & ANOMALY CHECKS
     // ==========================================
+    // ==========================================
+    // 1. UPDATE LOCATION & ANOMALY CHECKS
+    // ==========================================
     public Mono<Void> updateLocation(VehicleLocation location) {
         String sessionId = location.sessionId();
         String tombstoneKey = TOMBSTONE_PREFIX + sessionId;
@@ -113,45 +116,81 @@ public class LocationService {
         return redisTemplate.hasKey(tombstoneKey)
                 .flatMap(isDead -> {
                     if (Boolean.TRUE.equals(isDead)) {
-                        // This journey was ended. Ignore this malicious/zombie ping entirely!
                         System.out.println("🛡️ [SECURITY] Blocked ghost ping for ended session: " + sessionId);
                         return Mono.empty();
                     }
                     long now = System.currentTimeMillis();
                     String trailKey = "trail:" + sessionId;
-                    String memberValue = location.vehicleType() + ":" + sessionId;
                     Point point = new Point(location.longitude(), location.latitude());
 
-                    // 🚨 A. Perform stationary check FIRST (before we push the new location to the trail)
-                    Mono<Void> stationaryCheck = redisTemplate.opsForList().index(trailKey, 0)
+                    // We MUST fetch the previous location FIRST to do the math
+                    return redisTemplate.opsForList().index(trailKey, 0)
                             .cast(VehicleLocation.class)
-                            .flatMap(lastLoc -> processStationaryLogic(location, lastLoc, now))
-                            .switchIfEmpty(Mono.empty()); // If trail is empty (first update), do nothing
+                            .flatMap(lastLoc -> {
+                                // 🚨 NEW MATH: Calculate distance, speed, and bearing
+                                double distance = calculateDistance(lastLoc.latitude(), lastLoc.longitude(), location.latitude(), location.longitude());
+                                double speedMps = distance / 2.0; // Assuming 2-second pings
+                                double bearing = calculateBearing(lastLoc.latitude(), lastLoc.longitude(), location.latitude(), location.longitude());
 
-                    // B. Update the Live Geo Map (Overwrites old location)
-                    Mono<Long> updateGeoMap = redisTemplate.opsForGeo()
-                            .add(GEO_KEY, point, memberValue);
-                    Mono<Void> checkRecovery = redisTemplate.opsForSet().isMember(OFFLINE_KEY, sessionId)
-                            .flatMap(isOffline -> {
-                                if (Boolean.TRUE.equals(isOffline)) {
-                                    anomalyPublisher.publishSignalRestored(sessionId);
-                                    return redisTemplate.opsForSet().remove(OFFLINE_KEY, sessionId).then();
-                                }
-                                return Mono.empty();
-                            });
-                    // C. Save a "Breadcrumb Trail"
-                    Mono<Long> saveHistory = redisTemplate.opsForList()
-                            .leftPush(trailKey, location)
-                            .flatMap(size -> redisTemplate.opsForList().trim(trailKey, 0, 9))
-                            .then(redisTemplate.expire(trailKey, Duration.ofHours(24)))
-                            .thenReturn(1L);
+                                // 🚨 NEW STRING: Format it exactly like the Ghost Trucks
+                                String memberValue = String.format("%s:%s:%.2f:%.2f", location.vehicleType(), sessionId, speedMps, bearing);
 
-                    // 🚨 D. Update Heartbeat for Signal Lost detection
-                    Mono<Boolean> updateHeartbeat = redisTemplate.opsForZSet()
-                            .add(HEARTBEAT_KEY, sessionId, now);
+                                // 🚨 A. Perform stationary check FIRST
+                                Mono<Void> stationaryCheck = processStationaryLogic(location, lastLoc, now);
 
-                    // Execute the stationary check first, THEN update the map, trail, and heartbeat concurrently
-                    return stationaryCheck.then(Mono.when(updateGeoMap, saveHistory, updateHeartbeat, checkRecovery));
+                                // B. Update the Live Geo Map (With the NEW memberValue)
+                                Mono<Long> updateGeoMap = redisTemplate.opsForGeo().add(GEO_KEY, point, memberValue);
+
+                                // C. Check Recovery
+                                Mono<Void> checkRecovery = redisTemplate.opsForSet().isMember(OFFLINE_KEY, sessionId)
+                                        .flatMap(isOffline -> {
+                                            if (Boolean.TRUE.equals(isOffline)) {
+                                                anomalyPublisher.publishSignalRestored(sessionId);
+                                                return redisTemplate.opsForSet().remove(OFFLINE_KEY, sessionId).then();
+                                            }
+                                            return Mono.empty();
+                                        });
+
+                                // D. Save a "Breadcrumb Trail"
+                                Mono<Long> saveHistory = redisTemplate.opsForList()
+                                        .leftPush(trailKey, location)
+                                        .flatMap(size -> redisTemplate.opsForList().trim(trailKey, 0, 9))
+                                        .then(redisTemplate.expire(trailKey, Duration.ofHours(24)))
+                                        .thenReturn(1L);
+
+                                // E. Update Heartbeat for Signal Lost detection
+                                Mono<Boolean> updateHeartbeat = redisTemplate.opsForZSet()
+                                        .add(HEARTBEAT_KEY, sessionId, now);
+
+                                // Execute the stationary check first, THEN update the map, trail, and heartbeat concurrently
+                                return stationaryCheck.then(Mono.when(updateGeoMap, saveHistory, updateHeartbeat, checkRecovery));
+                            })
+                            .switchIfEmpty(Mono.defer(() -> {
+                                // 🚨 FALLBACK: If there is no previous location (First Ping ever!)
+                                String memberValue = String.format("%s:%s:0.0:0.0", location.vehicleType(), sessionId);
+                                Mono<Long> updateGeoMap = redisTemplate.opsForGeo().add(GEO_KEY, point, memberValue);
+
+                                Mono<Void> checkRecovery = redisTemplate.opsForSet().isMember(OFFLINE_KEY, sessionId)
+                                        .flatMap(isOffline -> {
+                                            if (Boolean.TRUE.equals(isOffline)) {
+                                                anomalyPublisher.publishSignalRestored(sessionId);
+                                                return redisTemplate.opsForSet().remove(OFFLINE_KEY, sessionId).then();
+                                            }
+                                            return Mono.empty();
+                                        });
+
+                                Mono<Long> saveHistory = redisTemplate.opsForList()
+                                        .leftPush(trailKey, location)
+                                        .flatMap(size -> redisTemplate.opsForList().trim(trailKey, 0, 9))
+                                        .then(redisTemplate.expire(trailKey, Duration.ofHours(24)))
+                                        .thenReturn(1L);
+
+                                Mono<Boolean> updateHeartbeat = redisTemplate.opsForZSet()
+                                        .add(HEARTBEAT_KEY, sessionId, now);
+
+                                // Return without stationary check (you can't be stationary on ping #1)
+                                return Mono.when(updateGeoMap, saveHistory, updateHeartbeat, checkRecovery);
+                            }));
                 });
     }
 
@@ -291,5 +330,27 @@ public class LocationService {
                         err -> System.err.println("❌ Error in Signal Scan: " + err.getMessage()),
                         () -> System.out.println("🔭 Signal scan complete.")
                 );
+    }
+    // Drop these at the bottom of LocationService.java
+    private double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+        double EARTH_RADIUS_METERS = 6371000.0;
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLon = Math.toRadians(lon2 - lon1);
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+                        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return EARTH_RADIUS_METERS * c;
+    }
+
+    private double calculateBearing(double lat1, double lon1, double lat2, double lon2) {
+        double lat1Rad = Math.toRadians(lat1);
+        double lat2Rad = Math.toRadians(lat2);
+        double deltaLon = Math.toRadians(lon2 - lon1);
+        double y = Math.sin(deltaLon) * Math.cos(lat2Rad);
+        double x = Math.cos(lat1Rad) * Math.sin(lat2Rad) -
+                Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(deltaLon);
+        double bearing = Math.atan2(y, x);
+        return (Math.toDegrees(bearing) + 360) % 360;
     }
 }
