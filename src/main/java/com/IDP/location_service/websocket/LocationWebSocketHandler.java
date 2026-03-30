@@ -12,6 +12,8 @@ import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
+
 @Component
 public class LocationWebSocketHandler implements WebSocketHandler {
 
@@ -54,9 +56,7 @@ public class LocationWebSocketHandler implements WebSocketHandler {
 
         System.out.println("🟢 WS Connected for Session: " + sessionId);
 
-        if (sessionId == null) {
-            return session.close(); // Reject connection if no session ID is provided
-        }
+
 
         // ==========================================
         // PIPE 1: INCOMING (Client -> Server)
@@ -81,24 +81,33 @@ public class LocationWebSocketHandler implements WebSocketHandler {
         // PIPE 2: OUTGOING (Server -> Client)
         // ==========================================
         // Call your exact method which returns Flux<List<NearbyVehicle>> ticking every 2 seconds
-        Flux<WebSocketMessage> sendStream = locationService.streamNearbyVehicles(sessionId)
+        Flux<WebSocketMessage> sendStream = Flux.interval(Duration.ofSeconds(2))
+                .flatMap(tick -> locationService.getUnifiedMapData()
+                        .collectList()
+                        // 🛡️ THE FIX: If the map data fails, catch the error and return an empty list!
+                        .onErrorResume(e -> {
+                            System.err.println("⚠️ Recovered from Map Fetch Error: " + e.getMessage());
+                            return Mono.just(java.util.Collections.emptyList());
+                        })
+                )
                 .map(vehicleList -> {
                     try {
-                        // Convert the List<NearbyVehicle> into a JSON string
                         String jsonResponse = objectMapper.writeValueAsString(vehicleList);
                         return session.textMessage(jsonResponse);
                     } catch (Exception e) {
-                        return session.textMessage("[]"); // Send empty array if serialization fails
+                        return session.textMessage("[]");
                     }
                 });
 
-        // Bind the outgoing stream to the session's sender
         Mono<Void> sendMono = session.send(sendStream);
+
+        // Bind the outgoing stream to the session's sender
+
 
         // ==========================================
         // MERGE: Run both pipes simultaneously
         // ==========================================
-        return Mono.zip(receiveStream, sendMono)
+        return Mono.when(receiveStream, sendMono)
                 .doFinally(sig -> System.out.println("🔴 WS Disconnected: " + sessionId))
                 .then();
     }

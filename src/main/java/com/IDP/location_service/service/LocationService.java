@@ -12,7 +12,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-
+import com.IDP.location_service.model.MapVehicle;
+import org.springframework.data.domain.Range;
+import org.springframework.data.geo.Point;
+import reactor.core.publisher.Flux;
 import java.time.Duration;
 
 @Service
@@ -22,9 +25,9 @@ public class LocationService {
     private final AnomalyEventPublisher anomalyPublisher; // 🚨 Added Publisher
     private static final String OFFLINE_KEY = "offline_vehicles";
     private static final String TOMBSTONE_PREFIX = "journey:ended:";
-
-    // Redis Keys
     private static final String GEO_KEY = "vehicle_locations";
+    private static final String PREDICTED_GEO_KEY = "predicted_locations";
+    // Redis Keys
     private static final String HEARTBEAT_KEY = "active_heartbeats"; // 🚨 New ZSet Key
 
     // Thresholds
@@ -34,6 +37,69 @@ public class LocationService {
     public LocationService(ReactiveRedisTemplate<String, Object> redisTemplate, AnomalyEventPublisher anomalyPublisher) {
         this.redisTemplate = redisTemplate;
         this.anomalyPublisher = anomalyPublisher;
+    }
+    public Flux<MapVehicle> getUnifiedMapData() {
+        return Flux.merge(
+                fetchFromRedis(GEO_KEY, "ACTIVE"),
+                fetchFromRedis(PREDICTED_GEO_KEY, "PREDICTED")
+        )
+                .groupBy(MapVehicle::sessionId)
+                .flatMap(group -> group.reduce((vehicle1, vehicle2) -> {
+                    return "ACTIVE".equals(vehicle1.status()) ? vehicle1 : vehicle2;
+                }));
+    }
+
+    private Flux<MapVehicle> fetchFromRedis(String key, String status) {
+        return redisTemplate.opsForZSet().range(key, Range.unbounded())
+                .flatMap(memberObj -> {
+                    String member = String.valueOf(memberObj);
+
+                    // In Reactive Redis, position() for a single member returns Mono<Point>
+                    return redisTemplate.opsForGeo().position(key, member)
+                            .flatMap(pointObj -> {
+                                // 1. If the point doesn't exist, safely skip it
+                                if (pointObj == null) {
+                                    return Mono.empty();
+                                }
+
+                                // 2. Cast it directly to a Point (No Lists!)
+                                org.springframework.data.geo.Point p = (org.springframework.data.geo.Point) pointObj;
+
+                                // 3. Map it to our DTO
+                                return Mono.just(parseToMapVehicle(member, p, status));
+                            });
+                });
+    }
+
+    private MapVehicle parseToMapVehicle(String member, org.springframework.data.geo.Point point, String status) {
+        // 1. Strip out any accidental JSON quotes
+        String cleanMember = member.replace("\"", "").trim();
+        String[] parts = cleanMember.split(":");
+
+        // 2. Safely extract base strings
+        String vehicleType = parts.length > 0 ? parts[0] : "unknown";
+        String sessionId = parts.length > 1 ? parts[1] : "unknown_session";
+
+        double speed = 0.0;
+        double bearing = 0.0;
+
+        // 3. Safely parse numbers and log any weird data
+        try {
+            speed = parts.length > 2 ? Double.parseDouble(parts[2]) : 0.0;
+            bearing = parts.length > 3 ? Double.parseDouble(parts[3]) : 0.0;
+        } catch (Exception e) {
+            System.err.println("⚠️ Failed to parse speed/bearing from member: " + cleanMember);
+        }
+
+        return new MapVehicle(
+                sessionId,
+                vehicleType,
+                point.getY(), // Latitude
+                point.getX(), // Longitude
+                bearing,
+                speed,
+                status
+        );
     }
 
 
@@ -125,6 +191,7 @@ public class LocationService {
         String tombstoneKey = TOMBSTONE_PREFIX + sessionId;
 
         Mono<Long> removeGeo = redisTemplate.opsForGeo().remove(GEO_KEY, memberValue);
+        Mono<Long> removePredicted = redisTemplate.opsForGeo().remove(PREDICTED_GEO_KEY, memberValue); // 🚨 2. Kill the Ghost Truck!
         Mono<Long> removeTrail = redisTemplate.delete(trailKey);
         Mono<Long> removeOffline = redisTemplate.opsForSet().remove(OFFLINE_KEY, sessionId);
         Mono<Boolean> plantTombstone = redisTemplate.opsForValue()
@@ -135,6 +202,7 @@ public class LocationService {
 
         return Mono.when(
                 removeGeo,
+                removePredicted,
                 removeTrail,
                 removeHeartbeat,
                 removeStationary,
@@ -203,15 +271,18 @@ public class LocationService {
                     String trailKey = "trail:" + sessionId;
 
                     return redisTemplate.opsForList().range(trailKey, 0, -1)
+                            .cast(VehicleLocation.class)
                             .collectList()
                             .flatMap(trail -> {
                                 // 3. Publish the Snapshot
                                 anomalyPublisher.publishSignalLostWithHistory(sessionId, trail);
-
+                                String vehicleType = trail.isEmpty() ? "unknown" : trail.get(0).vehicleType();
+                                String memberValue = vehicleType + ":" + sessionId;
                                 // 4. Cleanup
                                 return Mono.when(
                                         redisTemplate.opsForSet().add(OFFLINE_KEY, sessionId),
-                                        redisTemplate.opsForZSet().remove(HEARTBEAT_KEY, sessionId)
+                                        redisTemplate.opsForZSet().remove(HEARTBEAT_KEY, sessionId),
+                                        redisTemplate.opsForGeo().remove(GEO_KEY, memberValue)
                                 );
                             });
                 })

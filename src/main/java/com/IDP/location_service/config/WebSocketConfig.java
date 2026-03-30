@@ -4,6 +4,7 @@ import com.IDP.location_service.websocket.LocationWebSocketHandler;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.reactive.HandlerMapping;
 import org.springframework.web.reactive.handler.SimpleUrlHandlerMapping;
 import org.springframework.web.reactive.socket.WebSocketHandler;
@@ -24,6 +25,16 @@ public class WebSocketConfig {
         SimpleUrlHandlerMapping handlerMapping = new SimpleUrlHandlerMapping();
         handlerMapping.setOrder(-1); // Ensure this is checked before standard REST controllers
         handlerMapping.setUrlMap(map);
+
+        // CORS Setup to allow Postman and Frontend
+        CorsConfiguration corsConfig = new CorsConfiguration();
+        corsConfig.addAllowedOriginPattern("*"); // Allow all origins
+        corsConfig.addAllowedHeader("*");
+        corsConfig.addAllowedMethod("*");
+
+        // 🚨 FIX: Applied to 'handlerMapping' (Matched the variable name)
+        handlerMapping.setCorsConfigurations(Map.of("/ws/locations", corsConfig));
+
         return handlerMapping;
     }
 

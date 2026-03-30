@@ -1,5 +1,6 @@
 package com.IDP.location_service.service;
 
+import com.IDP.location_service.model.VehicleLocation;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
@@ -27,7 +28,7 @@ public class AnomalyEventPublisher {
         System.out.println("📶 [RESTORED] Signal back online for session: " + sessionId);
         kafkaTemplate.send("prediction-events", sessionId, "{\"eventType\":\"SIGNAL_RESTORED\", \"sessionId\":\"" + sessionId + "\"}");
     }
-    public void publishSignalLostWithHistory(String sessionId, java.util.List<Object> trail) {
+    public void publishSignalLostWithHistory(String sessionId, java.util.List<VehicleLocation> trail) {
         // We grab the most recent point from the trail for convenience
         Object lastSeen = trail.isEmpty() ? "unknown" : trail.get(0);
 
