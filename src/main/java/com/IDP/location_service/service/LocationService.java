@@ -123,25 +123,26 @@ public class LocationService {
                     String trailKey = "trail:" + sessionId;
                     Point point = new Point(location.longitude(), location.latitude());
 
-                    // We MUST fetch the previous location FIRST to do the math
+                    // 🚨 THE MISSING PIECE: Bulletproof Delete Scanner
+                    // This finds the exact old active dot (with the old speed) and deletes it!
+                    Mono<Long> removeOldActiveDot = redisTemplate.opsForZSet().range(GEO_KEY, Range.unbounded())
+                            .filter(member -> String.valueOf(member).contains(":" + sessionId + ":"))
+                            .flatMap(member -> redisTemplate.opsForZSet().remove(GEO_KEY, member))
+                            .reduce(0L, Long::sum)
+                            .defaultIfEmpty(0L);
+
                     return redisTemplate.opsForList().index(trailKey, 0)
                             .cast(VehicleLocation.class)
                             .flatMap(lastLoc -> {
-                                // 🚨 NEW MATH: Calculate distance, speed, and bearing
                                 double distance = calculateDistance(lastLoc.latitude(), lastLoc.longitude(), location.latitude(), location.longitude());
-                                double speedMps = distance / 2.0; // Assuming 2-second pings
+                                double speedMps = distance / 2.0;
                                 double bearing = calculateBearing(lastLoc.latitude(), lastLoc.longitude(), location.latitude(), location.longitude());
 
-                                // 🚨 NEW STRING: Format it exactly like the Ghost Trucks
                                 String memberValue = String.format("%s:%s:%.2f:%.2f", location.vehicleType(), sessionId, speedMps, bearing);
 
-                                // 🚨 A. Perform stationary check FIRST
                                 Mono<Void> stationaryCheck = processStationaryLogic(location, lastLoc, now);
-
-                                // B. Update the Live Geo Map (With the NEW memberValue)
                                 Mono<Long> updateGeoMap = redisTemplate.opsForGeo().add(GEO_KEY, point, memberValue);
 
-                                // C. Check Recovery
                                 Mono<Void> checkRecovery = redisTemplate.opsForSet().isMember(OFFLINE_KEY, sessionId)
                                         .flatMap(isOffline -> {
                                             if (Boolean.TRUE.equals(isOffline)) {
@@ -151,22 +152,22 @@ public class LocationService {
                                             return Mono.empty();
                                         });
 
-                                // D. Save a "Breadcrumb Trail"
                                 Mono<Long> saveHistory = redisTemplate.opsForList()
                                         .leftPush(trailKey, location)
                                         .flatMap(size -> redisTemplate.opsForList().trim(trailKey, 0, 9))
                                         .then(redisTemplate.expire(trailKey, Duration.ofHours(24)))
                                         .thenReturn(1L);
 
-                                // E. Update Heartbeat for Signal Lost detection
                                 Mono<Boolean> updateHeartbeat = redisTemplate.opsForZSet()
                                         .add(HEARTBEAT_KEY, sessionId, now);
 
-                                // Execute the stationary check first, THEN update the map, trail, and heartbeat concurrently
-                                return stationaryCheck.then(Mono.when(updateGeoMap, saveHistory, updateHeartbeat, checkRecovery));
+                                // 🚨 Execute the delete scanner FIRST, then save the new Map Dot
+                                return stationaryCheck.then(removeOldActiveDot)
+                                        .then(Mono.when(updateGeoMap, saveHistory, updateHeartbeat, checkRecovery))
+                                        .thenReturn(true);
                             })
                             .switchIfEmpty(Mono.defer(() -> {
-                                // 🚨 FALLBACK: If there is no previous location (First Ping ever!)
+                                // FALLBACK: Only runs on the very first ping now!
                                 String memberValue = String.format("%s:%s:0.0:0.0", location.vehicleType(), sessionId);
                                 Mono<Long> updateGeoMap = redisTemplate.opsForGeo().add(GEO_KEY, point, memberValue);
 
@@ -188,9 +189,12 @@ public class LocationService {
                                 Mono<Boolean> updateHeartbeat = redisTemplate.opsForZSet()
                                         .add(HEARTBEAT_KEY, sessionId, now);
 
-                                // Return without stationary check (you can't be stationary on ping #1)
-                                return Mono.when(updateGeoMap, saveHistory, updateHeartbeat, checkRecovery);
-                            }));
+                                // 🚨 Execute the delete scanner FIRST here too
+                                return removeOldActiveDot
+                                        .then(Mono.when(updateGeoMap, saveHistory, updateHeartbeat, checkRecovery))
+                                        .thenReturn(true);
+                            }))
+                            .then(); // 🚨 Convert the 'true' back to 'Void' at the very end to satisfy the method signature
                 });
     }
 
@@ -224,30 +228,30 @@ public class LocationService {
     // 2. REMOVE VEHICLE (CLEANUP)
     // ==========================================
     public Mono<Void> removeVehicle(String vehicleType, String sessionId) {
-        String memberValue = vehicleType + ":" + sessionId;
         String trailKey = "trail:" + sessionId;
         String stationaryKey = "stationary_since:" + sessionId;
         String tombstoneKey = TOMBSTONE_PREFIX + sessionId;
 
-        Mono<Long> removeGeo = redisTemplate.opsForGeo().remove(GEO_KEY, memberValue);
-        Mono<Long> removePredicted = redisTemplate.opsForGeo().remove(PREDICTED_GEO_KEY, memberValue); // 🚨 2. Kill the Ghost Truck!
+        // 🚨 Bulletproof Delete: Scans the map for the exact string containing the session ID
+        Mono<Long> removeGeo = redisTemplate.opsForZSet().range(GEO_KEY, Range.unbounded())
+                .filter(member -> String.valueOf(member).contains(":" + sessionId + ":"))
+                .flatMap(member -> redisTemplate.opsForZSet().remove(GEO_KEY, member))
+                .reduce(0L, Long::sum)
+                .defaultIfEmpty(0L);
+
+        Mono<Long> removePredicted = redisTemplate.opsForZSet().range(PREDICTED_GEO_KEY, Range.unbounded())
+                .filter(member -> String.valueOf(member).contains(":" + sessionId + ":"))
+                .flatMap(member -> redisTemplate.opsForZSet().remove(PREDICTED_GEO_KEY, member))
+                .reduce(0L, Long::sum)
+                .defaultIfEmpty(0L);
+
         Mono<Long> removeTrail = redisTemplate.delete(trailKey);
         Mono<Long> removeOffline = redisTemplate.opsForSet().remove(OFFLINE_KEY, sessionId);
-        Mono<Boolean> plantTombstone = redisTemplate.opsForValue()
-                .set(tombstoneKey, "DEAD", Duration.ofHours(24));
-        // 🚨 Also clean up heartbeat and stationary keys so we don't get false positives
+        Mono<Boolean> plantTombstone = redisTemplate.opsForValue().set(tombstoneKey, "DEAD", Duration.ofHours(24));
         Mono<Long> removeHeartbeat = redisTemplate.opsForZSet().remove(HEARTBEAT_KEY, sessionId);
         Mono<Long> removeStationary = redisTemplate.delete(stationaryKey);
 
-        return Mono.when(
-                removeGeo,
-                removePredicted,
-                removeTrail,
-                removeHeartbeat,
-                removeStationary,
-                removeOffline,
-                plantTombstone
-        );
+        return Mono.when(removeGeo, removePredicted, removeTrail, removeHeartbeat, removeStationary, removeOffline, plantTombstone);
     }
 
     // ==========================================
@@ -301,10 +305,9 @@ public class LocationService {
         long cutoffTime = System.currentTimeMillis() - SIGNAL_LOST_THRESHOLD_MS;
 
         redisTemplate.opsForZSet()
-                // 1. Get the list of all expired session IDs first
                 .rangeByScore(HEARTBEAT_KEY, org.springframework.data.domain.Range.closed(0.0, (double) cutoffTime))
                 .collectList()
-                .flatMapMany(Flux::fromIterable) // 2. Now process them one by one
+                .flatMapMany(Flux::fromIterable)
                 .flatMap(sessionIdObj -> {
                     String sessionId = String.valueOf(sessionIdObj);
                     String trailKey = "trail:" + sessionId;
@@ -313,23 +316,23 @@ public class LocationService {
                             .cast(VehicleLocation.class)
                             .collectList()
                             .flatMap(trail -> {
-                                // 3. Publish the Snapshot
                                 anomalyPublisher.publishSignalLostWithHistory(sessionId, trail);
-                                String vehicleType = trail.isEmpty() ? "unknown" : trail.get(0).vehicleType();
-                                String memberValue = vehicleType + ":" + sessionId;
-                                // 4. Cleanup
+
+                                // 🚨 Bulletproof Delete for the Zombie
+                                Mono<Long> removeZombie = redisTemplate.opsForZSet().range(GEO_KEY, Range.unbounded())
+                                        .filter(member -> String.valueOf(member).contains(":" + sessionId + ":"))
+                                        .flatMap(member -> redisTemplate.opsForZSet().remove(GEO_KEY, member))
+                                        .reduce(0L, Long::sum)
+                                        .defaultIfEmpty(0L);
+
                                 return Mono.when(
                                         redisTemplate.opsForSet().add(OFFLINE_KEY, sessionId),
                                         redisTemplate.opsForZSet().remove(HEARTBEAT_KEY, sessionId),
-                                        redisTemplate.opsForGeo().remove(GEO_KEY, memberValue)
+                                        removeZombie
                                 );
                             });
                 })
-                .subscribe(
-                        null,
-                        err -> System.err.println("❌ Error in Signal Scan: " + err.getMessage()),
-                        () -> System.out.println("🔭 Signal scan complete.")
-                );
+                .subscribe(null, err -> System.err.println("❌ Error: " + err.getMessage()), () -> System.out.println("🔭 Signal scan complete."));
     }
     // Drop these at the bottom of LocationService.java
     private double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
